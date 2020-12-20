@@ -29,6 +29,14 @@ def log(sql, args=()):
     logging.info('SQL: %s' % sql)
 
 
+# 该函数在ModelMetaclass中调用
+def create_args_string(num):
+    L = []
+    for n in range(num):
+        L.append('?')
+    return ', '.join(L)
+
+
 # Select：
 async def select(sql, args, size=None):
     log(sql, args)
@@ -135,7 +143,7 @@ class ModelMetaclass(type):
         tableName = attrs.get('__table__', None) or name
         logging.info('found model: %s (table: %s)' % (name, tableName))
         # 建立映射关系表和找到主键
-        mappings = {}   # 用于保存映射关系
+        mappings = {}  # 用于保存映射关系
         fields = []  # 用于保存所有字段名
         primaryKey = None  # 保存主键
         # 遍历类的属性,找出定义的域(如StringField,字符串域)内的值,建立映射关系
@@ -163,16 +171,12 @@ class ModelMetaclass(type):
         attrs['__fields__'] = fields  # 除主键外的属性名
         # -----------------------默认SQL语句--------------------------
         attrs['__select__'] = 'select `%s`, %s from `%s`' % (primaryKey, ', '.join(escaped_fields), tableName)
-        attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' % (tableName, ', '.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
-        attrs['__update__'] = 'update `%s` set %s where `%s`=?' % (tableName, ', '.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
+        attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' % (
+        tableName, ', '.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
+        attrs['__update__'] = 'update `%s` set %s where `%s`=?' % (
+        tableName, ', '.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
         attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
         return type.__new__(cls, name, bases, attrs)
-
-
-    
-
-
-
 
 
 # ORM映射基类，继承自dict，通过ModelMetaclass元类来构造类
@@ -209,3 +213,86 @@ class Model(dict, metaclass=ModelMetaclass):
                 # 通过default取到值之后再将其作为当前值
                 setattr(self, key, value)
         return value
+
+    # 对于查询相关的操作，我们都定义为类方法，就可以方便查询，而不必先创建实例再查询
+    # 查找所有合乎条件的信息
+    @classmethod
+    async def findAll(cls, where=None, args=None, **kw):
+        """ find object by where clause."""
+        # 初始化SQL语句和参数列表：
+        sql = [cls.__select__]
+        if args is None:
+            args = []
+        # WHERE 查找条件的关键字
+        if where:
+            sql.append('where')
+            sql.append(where)
+        # ORDER BY，按照啥关键字排序：
+        if kw.get('orderBy', None) is not None:
+            sql.append('order by')
+            sql.append(kw['orderBy'])
+        # LIMIT 要来对结果集进行筛选：
+        limit = kw.get('limit', None)
+        if limit is not None:
+            sql.append('limit')
+            if isinstance(limit, int):  # 如果是int类型，则增加占位符
+                sql.append('?')
+                args.append(limit)
+            elif isinstance(limit, tuple) and len(limit) == 2:  # limit可以取2个参数，表示一个范围
+                sql.append('?, ?')
+                args.append(limit)
+            else:
+                raise ValueError('Invalid limit value: %s' % str(limit))
+        # 调用前面定义的select函数，没有指定size,因此会fetchall,即返回所有结果
+        rs = await select(' '.join(sql), args)
+        # 从Model的初始化可以得知，以Model为父类的实例也是会得到字典结果，即返回一个元素为字典的列表：
+        return [cls(**r) for r in rs]
+
+    # 根据列名和条件查看数据库有多少条信息
+    @classmethod
+    async def findNumber(cls, selectField, where=None, args=None):
+        """ find number by select and where. """
+        sql = ['select %s _num_ from `%s`' % (selectField, cls.__table__)]
+        if where:
+            sql.append('where')
+            sql.append(where)
+        rs = await select(' '.join(sql), args, 1)  # size = 1
+        return rs[0]['_num_'] if len(rs) != 0 else None
+
+    # 根据主键查找一个实例的信息
+    @classmethod
+    async def find(cls, pk):
+        """find object by primary key"""
+        rs = await select('%s where `%s`=?' % (cls.__select__, cls.__primary_key__), [pk], 1)
+        return cls(**rs[0]) if len(rs) != 0 else None
+
+    # 把一个实例保存到数据库
+    async def save(self):
+        args = list(map(self.getValueOrDefault, self.__fields))
+        args.append(self.getValueOrDefault(self.__primary_key__))
+        rows = await execute(self.__insert__, args)
+        if rows != 1:
+            logging.warning('failed to insert record: affected rows: %s' % rows)
+
+    # 更改一个实例在数据库的信息
+    async def update(self):
+        args = list(map(self.getValue, self.__fields__))
+        args.append(self.getValue(self.__primary_key__))
+        rows = await execute(self.__update__, args)
+        if rows != 1:
+            logging.warning('failed to update by primary key: affected rows: %s' % rows)
+
+    # 把一个实例从数据库中删除
+    async def remove(self):
+        args = [self.getValue(self.__primary_key__)]
+        rows = await execute(self.__delete__,args)
+        if rows != 1:
+            logging.warning('failded to remove by primary key: affected rows: %s' % rows)
+
+    # 参考中的一个函数：
+    # def to_json(self, **kw):
+    #     return self.copy()
+
+
+
+
